@@ -1,1 +1,1 @@
-# ifc_osmod_utils
+# ifc_utils
