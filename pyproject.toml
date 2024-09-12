@@ -15,7 +15,8 @@ classifiers = ["License :: OSI Approved :: GNU General Public License v3 (GPLv3)
                "Programming Language :: Python :: 3.10",
                "Operating System :: OS Independent"]
 dependencies = ['geomie3d==0.0.9',
-                'ifcopenshell==0.7.0.240406'
+                'ifcopenshell==0.8.0',
+                'lark==1.2.2'
                 ]
 
 [project.urls]

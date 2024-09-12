@@ -1,6 +1,5 @@
 import json
 import copy
-from pprint import pprint
 
 import numpy as np
 import geomie3d
@@ -9,6 +8,74 @@ import ifcopenshell
 import ifcopenshell.geom
 import ifcopenshell.validate
 import ifcopenshell.util.unit
+
+def calc_vobj_height_width(xyzs: np.ndarray, zdir: list[float], ydir: list[float], viz: bool = False) -> tuple[float, float]:
+    '''
+    Calculates the height and width of a vertical element using the directions of the normal and x and y direction of the local coordinate.
+
+    Parameters
+    ----------
+    xyzs : np.ndarray
+        np.ndarray[shape(number of points, 3)]. Must be more than 3 points at least.
+    
+    xdir : list[float]
+        The x direction of the vertical object
+
+    ydir : list[float]
+        the up/y direction of the vertical object. Obtained by cross product of nrml and xdir
+
+    Returns
+    -------
+    height_width : tuple[float, float]
+        the first value is the height, the second value is width
+    '''
+    bbox = geomie3d.calculate.bbox_frm_xyzs(xyzs)
+    center_xyz = geomie3d.calculate.bboxes_centre([bbox])[0]
+    # check the bounding box if it is a flat surface we can get the dimension easier
+    xdim = bbox.maxx - bbox.minx
+    ydim = bbox.maxy - bbox.miny
+    zdim = bbox.maxz - bbox.minz
+    win_dims = np.array([xdim, ydim, zdim])
+    dim_cond = win_dims == 0
+    dim_cond = np.where(dim_cond)[0]
+    if dim_cond.size == 0:
+        # the bbox is a box
+        # project the center xyz up down left right to get the height and width
+        r_up = geomie3d.create.ray(center_xyz, ydir)
+        ydir_rev = geomie3d.calculate.reverse_vectorxyz(ydir)
+        r_dn = geomie3d.create.ray(center_xyz, ydir_rev)
+        r_z = geomie3d.create.ray(center_xyz, zdir)
+        zdir_rev = geomie3d.calculate.reverse_vectorxyz(zdir)
+        r_zneg = geomie3d.create.ray(center_xyz, zdir_rev)
+        box = geomie3d.create.boxes_frm_bboxes([bbox])[0]
+        box_faces = geomie3d.get.faces_frm_solid(box)
+        box_faces = [geomie3d.modify.reverse_face_normal(wf) for wf in box_faces]
+        dim_proj_res = geomie3d.calculate.rays_faces_intersection([r_up, r_dn, r_z, r_zneg], box_faces)
+        hit_rays = dim_proj_res[0]
+        intxs = extract_intx_frm_hit_rays(hit_rays)
+        intxs_xyzs = [intx.point.xyz for intx in intxs]
+        ct_pts = np.array([center_xyz, center_xyz, center_xyz, center_xyz])
+        dists = geomie3d.calculate.dist_btw_xyzs(ct_pts, intxs_xyzs)
+        height = dists[0] + dists[1]
+        width = dists[2] + dists[3]
+        if viz == True:
+            center_vert = geomie3d.create.vertex(center_xyz)
+            geomie3d.viz.viz([{'topo_list': [box], 'colour': 'blue'},
+                            {'topo_list': [center_vert], 'colour': 'red'},
+                            {'topo_list': intxs, 'colour': 'red'}])
+
+    elif dim_cond.size == 1:
+        #  the bbox is just a surface
+        if dim_cond[0] == 0:
+            height = zdim
+            width = ydim
+        if dim_cond[0] == 1:
+            height = zdim
+            width = xdim
+    else:
+        print('the bbox is either a line or a point, there is no height nor width')
+
+    return height, width
 
 def collect_psets(pset: dict, constr_dicts: dict) -> int:
     '''
@@ -144,6 +211,35 @@ def create_osmod_pset_template(ifcmodel: ifcopenshell.file, pset_path: str) -> i
         
     return ifc_template
 
+def edit_pset_val(pset_val: ifcopenshell.entity_instance, ifcmodel: ifcopenshell.file, ifc_obj: ifcopenshell.entity_instance, pset_name: str):
+    """
+    extract the envelope and material layer set with the specified pset from the ifcmodel
+    
+    Parameters
+    ----------
+    pset_val: ifcopenshell.entity_instance
+        the new value, IfcThermalResistanceMeasure or IfcThermalTransmittanceMeasure etc..
+
+    ifcmodel : ifcopenshell.file.file
+        ifc model.
+    
+    ifc_obj: ifcopenshell.entity_instance
+        the ifc entity to search for the pset
+
+    pset_name : str
+        The name of the pset to edit.
+    """
+    related_objs = find_objs_in_reldefinesbyproperties(ifcmodel, ifc_obj, ifc_class_to_find='IfcPropertySet')
+    for related_obj in related_objs:
+        obj_pset_name = related_obj.Name
+        if obj_pset_name == pset_name:
+            sgl_val = related_obj.HasProperties[0]
+            sgl_val_name = sgl_val.Name
+            new_sgl_val = ifcmodel.createIfcPropertySingleValue()
+            new_sgl_val.Name = sgl_val_name
+            new_sgl_val.NominalValue = pset_val
+            related_obj.HasProperties = [new_sgl_val]
+
 def extract_envlp_mat_layer_pset(ifcmodel: ifcopenshell.file, mls_psets: dict) -> tuple[dict, str]:
     """
     extract the envelope and material layer set with the specified pset from the ifcmodel
@@ -205,6 +301,15 @@ def extract_envlp_mat_layer_pset(ifcmodel: ifcopenshell.file, mls_psets: dict) -
             csv_str+='\n'
     
     return envlp_json, csv_str
+
+def extract_intx_frm_hit_rays(hit_rays: list[geomie3d.utility.Ray]) -> list[geomie3d.topobj.Vertex]:
+    vs = []
+    for r in hit_rays:
+        att = r.attributes['rays_faces_intersection']
+        intx = att['intersection'][0]
+        v = geomie3d.create.vertex(intx)
+        vs.append(v)
+    return vs
 
 def extract_mat_layer_sets_pset(ifcmodel: ifcopenshell.file, pset_name: str, is_calc_massless: bool = False) -> dict:
     """
@@ -314,6 +419,35 @@ def extract_mat_layer_sets_pset(ifcmodel: ifcopenshell.file, pset_name: str, is_
                 mls_psets[mls_id]['massless_csv'] = massless_csv_str
 
     return mls_psets
+
+def extrude(xyzs: np.ndarray | list, extrusion: float, direction: list[float] = None) -> dict:
+    '''
+    extrude in normal direction or if specified the direction.
+
+    Parameters
+    ----------
+    xyzs: np.ndarray
+        np.ndarray[shape(number of points, 3)] the points forming the polygon face to be extruded.
+
+    extrusion: float
+        the magnitude of extrusion
+
+    direction: list[float]
+        list[shape(3)] direction of the extrusion. Default = None. If none normal of the face (defined by the xyzs) is used for extrusion.
+
+    Returns
+    -------
+    dict
+        dictionary of the polymesh with two keys: vertices and indices.
+    '''
+    g3d_verts = geomie3d.create.vertex_list(xyzs)
+    g3d_srf = geomie3d.create.polygon_face_frm_verts(g3d_verts)
+    if direction is None:
+        direction = geomie3d.get.face_normal(g3d_srf)
+    extruded = geomie3d.create.extrude_polygon_face(g3d_srf, direction, extrusion)
+    extruded_faces = geomie3d.get.faces_frm_solid(extruded)
+    poly_mesh_dict = geomie3d.modify.faces2polymesh(extruded_faces)
+    return poly_mesh_dict
 
 def find_objs_in_relaggregates(ifcmodel: ifcopenshell.file, ifc_obj: ifcopenshell.entity_instance, ifc_class_to_find: str = None, 
                                related_or_relating: str = 'RelatedObjects') -> list[ifcopenshell.entity_instance]:
@@ -462,6 +596,102 @@ def find_objs_in_relcontainedinspatialstructure(ifcmodel: ifcopenshell.file, ifc
 
     return found_objs
 
+def find_objs_in_reldefinesbyproperties(ifcmodel: ifcopenshell.file, ifc_obj: ifcopenshell.entity_instance, ifc_class_to_find: str = None, 
+                                        obj_or_prop: str = 'RelatingPropertyDefinition') -> list[ifcopenshell.entity_instance]:
+    """
+    find the related objects of interest
+    
+    Parameters
+    ----------
+    ifcmodel : ifcopenshell.file.file
+        ifc model.
+    
+    ifc_obj: ifcopenshell.entity_instance
+        the ifc entity to search for
+
+    ifc_class_to_find: str, optional
+        the ifc class of interest to find related to ifc_obj
+    
+    obj_or_prop: str, optional
+        Default = 'RelatingPropertyDefinition'. 'RelatedObjects' to get the object related to this property definition.
+
+    Returns
+    -------
+    list[ifcopenshell.entity_instance]
+        found ifc objects
+    """
+    found_objs = []
+    invs = ifcmodel.get_inverse(ifc_obj)
+    for inv in invs:
+        if inv.is_a('IfcRelDefinesByProperties'):
+            inv_info = inv.get_info()
+            # print(inv_info)
+            if obj_or_prop == 'RelatedObjects':
+                rel_eles = inv_info[obj_or_prop]
+                for rel_ele in rel_eles:
+                    if ifc_class_to_find is not None:
+                        if rel_ele.is_a(ifc_class_to_find):
+                            found_objs.append(rel_ele)
+                    else:
+                        found_objs.append(rel_ele)
+            elif obj_or_prop == 'RelatingPropertyDefinition':
+                rel_struct = inv_info[obj_or_prop]
+                if ifc_class_to_find is not None:
+                    if rel_struct.is_a(ifc_class_to_find):
+                        found_objs.append(rel_struct)
+                else:
+                    found_objs.append(rel_struct)
+
+    return found_objs
+
+def find_objs_in_relvoidselement(ifcmodel: ifcopenshell.file, ifc_obj: ifcopenshell.entity_instance, ifc_class_to_find: str = None, 
+                                 obj_or_prop: str = 'RelatedOpeningElement') -> list[ifcopenshell.entity_instance]:
+    """
+    find the related objects of interest
+    
+    Parameters
+    ----------
+    ifcmodel : ifcopenshell.file.file
+        ifc model.
+    
+    ifc_obj: ifcopenshell.entity_instance
+        the ifc entity to search for
+
+    ifc_class_to_find: str, optional
+        the ifc class of interest to find related to ifc_obj
+    
+    obj_or_prop: str, optional
+        Default = 'RelatedOpeningElement'. 'RelatingBuildingElement' to get the object related to this property definition.
+
+    Returns
+    -------
+    list[ifcopenshell.entity_instance]
+        found ifc objects
+    """
+    found_objs = []
+    invs = ifcmodel.get_inverse(ifc_obj)
+    for inv in invs:
+        # print(inv)
+        if inv.is_a('IfcRelVoidsElement'):
+            inv_info = inv.get_info()
+            # print(inv_info)
+            if obj_or_prop == 'RelatedOpeningElement':
+                rel_open = inv_info[obj_or_prop]
+                if ifc_class_to_find is not None:
+                    if rel_open.is_a(ifc_class_to_find):
+                        found_objs.append(rel_open)
+                else:
+                    found_objs.append(rel_open)
+            elif obj_or_prop == 'RelatingBuildingElement':
+                rel_ele = inv_info[obj_or_prop]
+                if ifc_class_to_find is not None:
+                    if rel_ele.is_a(ifc_class_to_find):
+                        found_objs.append(rel_ele)
+                else:
+                    found_objs.append(rel_ele)
+
+    return found_objs
+
 def find_spacezones_in_storey(ifcmodel: ifcopenshell.file, ifc_bldgstorey: ifcopenshell.entity_instance) -> list[ifcopenshell.entity_instance]:
     """
     find the related objects of interest
@@ -606,7 +836,7 @@ def get_default_pset(pset_path: str, template_only: bool = False) -> dict:
         pset_schema = {schema_title: template}
         return pset_schema
 
-def get_ifc_building_info(ifcmodel: ifcopenshell.file, envlp_pset_name: str = 'Pset_OsmodMassless') -> dict:
+def get_ifc_building_info(ifcmodel: ifcopenshell.file, envlp_pset_name: str = 'Pset_OsmodThermalResistance') -> dict:
     """
     extract all the ifc building information
     
@@ -616,7 +846,7 @@ def get_ifc_building_info(ifcmodel: ifcopenshell.file, envlp_pset_name: str = 'P
         ifc model.
 
     envlp_pset_name: str, optional
-        the pset name to retrieve from the building envelope. Default = Pset_OsmodMassless
+        the pset name to retrieve from the building envelope. Default = Pset_OsmodThermalResistance
 
     Returns
     -------
@@ -624,7 +854,7 @@ def get_ifc_building_info(ifcmodel: ifcopenshell.file, envlp_pset_name: str = 'P
         - nested dictionary with the globalid as key
         - each dictionary has the following keys: 
         - name: name
-        - ifc_envelope: ifcwall, ifcslab and ifcroof that belongs to this story. 1st lvl key globalid, 2nd lvl keys: pset, surfaces
+        - ifc_envelope: ifcwall, ifcslab and ifcroof that belongs to this building. 1st lvl key globalid, 2nd lvl keys: pset, surfaces
     """
     bldg_dicts = {}
     buildings = ifcmodel.by_type('IfcBuilding')
@@ -640,21 +870,21 @@ def get_ifc_building_info(ifcmodel: ifcopenshell.file, envlp_pset_name: str = 'P
             ifc_slabs = find_objs_in_relcontainedinspatialstructure(ifcmodel, story, ifc_class_to_find='IfcSlab')
             ifc_roofs = find_objs_in_relcontainedinspatialstructure(ifcmodel, story, ifc_class_to_find='IfcRoof')
             ifc_envlps = ifc_walls + ifc_slabs + ifc_roofs
-            ifc_envlp_dict = get_ifc_envlp_info(ifc_envlps, envlp_pset_name)
+            ifc_envlp_dict = get_ifc_envlp_info(ifc_envlps, envlp_pset_name = envlp_pset_name)
             ifc_envlp_dicts.update(ifc_envlp_dict)
         
         bldg_dicts[bldg_id] = {'name': name, 'ifc_envelope': ifc_envlp_dicts}
 
     return bldg_dicts
 
-def get_ifc_envlp_info(ifc_envlps: list[ifcopenshell.entity_instance], envlp_pset_name: str) -> dict:
+def get_ifc_envlp_info(ifc_envlps: list[ifcopenshell.entity_instance], envlp_pset_name: str = None) -> dict:
     """
-    extract all the spacezone information
+    extract all the envelope information
     
     Parameters
     ----------
     ifc_envlps: list[ifcopenshell.entity_instance]
-        ifc model.
+        ifc envelope objects.
 
     envlp_pset_name: str
         the pset name to retrieve from the building envelope.
@@ -662,7 +892,7 @@ def get_ifc_envlp_info(ifc_envlps: list[ifcopenshell.entity_instance], envlp_pse
     Returns
     -------
     dict
-        - ifc_envelope: ifcwall, ifcslab and ifcroof that belongs to this story. 1st lvl key globalid, 
+        - ifc_envelope: ifcwall, ifcslab and ifcroof. 1st lvl key globalid, 
         - 2nd lvl keys: type, predefined_type, pset, surfaces
         - each surface has attributes 'id' of the ifc_envlope dictionary id
     """
@@ -674,7 +904,10 @@ def get_ifc_envlp_info(ifc_envlps: list[ifcopenshell.entity_instance], envlp_pse
         envlp_type = envlp_info['type']
         envlp_pre_type = envlp_info['PredefinedType']
         envlp_id = envlp_info['GlobalId']
-        envlp_pset = ifcopenshell.util.element.get_psets(ifc_envlp, psets_only=True)[envlp_pset_name]
+        if envlp_pset_name == None:
+            envlp_pset = None
+        else:    
+            envlp_pset = ifcopenshell.util.element.get_psets(ifc_envlp, psets_only=True)[envlp_pset_name]
         envlp_faces = ifcopenshell_entity_geom2g3d(ifc_envlp)
         # geomie3d.viz.viz([{'topo_list': envlp_faces, 'colour': 'green'}])
         for envlp_face in envlp_faces:
@@ -803,7 +1036,7 @@ def get_ifc_spatial_zone_info(ifcmodel: ifcopenshell.file, story_dicts: dict, bl
                 ifc_slabs = ifcmodel.by_type('ifcSlab')
                 ifc_roofs = ifcmodel.by_type('ifcRoof')
                 ifc_envlps = ifc_walls + ifc_slabs + ifc_roofs
-                ifc_envlp_dicts = get_ifc_envlp_info(ifc_envlps, envlp_pset_name)
+                ifc_envlp_dicts = get_ifc_envlp_info(ifc_envlps, envlp_pset_name = envlp_pset_name)
 
             # convert the geometries of the ifc envelope into geomie3d geometries for processing
             envlp_vals = ifc_envlp_dicts.values()
@@ -858,7 +1091,7 @@ def get_ifc_story_info(ifcmodel: ifcopenshell.file) -> dict:
     
     Parameters
     ----------
-    ifcmodel : ifcopenshell.file.file
+    ifcmodel : ifcopenshell.file
         ifc model.
 
     Returns
@@ -871,7 +1104,7 @@ def get_ifc_story_info(ifcmodel: ifcopenshell.file) -> dict:
     """
     story_dicts = {}
     storys = ifcmodel.by_type('IfcBuildingStorey')
-    for story in storys[0:]:
+    for story in storys:
         # get the building this story belongs to
         ifcbldg = find_objs_in_relaggregates(ifcmodel, story, ifc_class_to_find='IfcBuilding', related_or_relating='RelatingObject')[0]
         bldg_id = ifcbldg.get_info()['GlobalId']
@@ -908,83 +1141,6 @@ def get_ifc_subsrf_info(ifcmodel: ifcopenshell.file, space_zone_dicts: dict, pse
             ray = geomie3d.create.ray(v.point.xyz, dir_xyz)
             rays.append(ray)
         return rays
-
-    def extract_intx_frm_hit_rays(hit_rays: list[geomie3d.utility.Ray]) -> list[geomie3d.topobj.Vertex]:
-        vs = []
-        for r in hit_rays:
-            att = r.attributes['rays_faces_intersection']
-            intx = att['intersection'][0]
-            v = geomie3d.create.vertex(intx)
-            vs.append(v)
-        return vs
-
-    def calc_vobj_height_width(xyzs: np.ndarray, zdir: list[float], ydir: list[float], viz: bool = False) -> tuple[float, float]:
-        '''
-        Calculates the height and width of a vertical element using the directions of the normal and x and y direction of the local coordinate.
-
-        Parameters
-        ----------
-        xyzs : np.ndarray
-            np.ndarray[shape(number of points, 3)]. Must be more than 3 points at least.
-        
-        xdir : list[float]
-            The x direction of the vertical object
-
-        ydir : list[float]
-            the up/y direction of the vertical object. Obtained by cross product of nrml and xdir
-
-        Returns
-        -------
-        height_width : tuple[float, float]
-            the first value is the height, the second value is width
-        '''
-        bbox = geomie3d.calculate.bbox_frm_xyzs(xyzs)
-        center_xyz = geomie3d.calculate.bboxes_centre([bbox])[0]
-        # check the bounding box if it is a flat surface we can get the dimension easier
-        xdim = bbox.maxx - bbox.minx
-        ydim = bbox.maxy - bbox.miny
-        zdim = bbox.maxz - bbox.minz
-        win_dims = np.array([xdim, ydim, zdim])
-        dim_cond = win_dims == 0
-        dim_cond = np.where(dim_cond)[0]
-        if dim_cond.size == 0:
-            # the bbox is a box
-            # project the center xyz up down left right to get the height and width
-            r_up = geomie3d.create.ray(center_xyz, ydir)
-            ydir_rev = geomie3d.calculate.reverse_vectorxyz(ydir)
-            r_dn = geomie3d.create.ray(center_xyz, ydir_rev)
-            r_z = geomie3d.create.ray(center_xyz, zdir)
-            zdir_rev = geomie3d.calculate.reverse_vectorxyz(zdir)
-            r_zneg = geomie3d.create.ray(center_xyz, zdir_rev)
-            box = geomie3d.create.boxes_frm_bboxes([bbox])[0]
-            box_faces = geomie3d.get.faces_frm_solid(box)
-            box_faces = [geomie3d.modify.reverse_face_normal(wf) for wf in box_faces]
-            dim_proj_res = geomie3d.calculate.rays_faces_intersection([r_up, r_dn, r_z, r_zneg], box_faces)
-            hit_rays = dim_proj_res[0]
-            intxs = extract_intx_frm_hit_rays(hit_rays)
-            intxs_xyzs = [intx.point.xyz for intx in intxs]
-            ct_pts = np.array([center_xyz, center_xyz, center_xyz, center_xyz])
-            dists = geomie3d.calculate.dist_btw_xyzs(ct_pts, intxs_xyzs)
-            height = dists[0] + dists[1]
-            width = dists[2] + dists[3]
-            if viz == True:
-                center_vert = geomie3d.create.vertex(center_xyz)
-                geomie3d.viz.viz([{'topo_list': [box], 'colour': 'blue'},
-                                {'topo_list': [center_vert], 'colour': 'red'},
-                                {'topo_list': intxs, 'colour': 'red'}])
-
-        elif dim_cond.size == 1:
-            #  the bbox is just a surface
-            if dim_cond[0] == 0:
-                height = zdim
-                width = ydim
-            if dim_cond[0] == 1:
-                height = zdim
-                width = xdim
-        else:
-            print('the bbox is either a line or a point, there is no height nor width')
-
-        return height, width
 
     # collect all the simple glazing constructions
     win_constr_dicts = {}
@@ -1089,8 +1245,8 @@ def get_ifc_subsrf_info(ifcmodel: ifcopenshell.file, space_zone_dicts: dict, pse
                     # x_v = geomie3d.create.vertex_list([center_xyz, x_pt])
                     # xedge = geomie3d.create.pline_edge_frm_verts(x_v)
                     # endregion: for visualizing the wall local coordinate system
-                    # get the window height and width
-                    win_height, win_width = calc_vobj_height_width(verts3d, z_dir, y_dir, viz = False)
+                # get the window height and width
+                win_height, win_width = calc_vobj_height_width(verts3d, z_dir, y_dir, viz = False)
 
             # get wall height and width
             wall_verts = geomie3d.get.vertices_frm_face(closest_srf)
@@ -1263,6 +1419,38 @@ def ifcopenshell_entity_geom2g3d(ifc_object: ifcopenshell.entity_instance) -> li
     # print('ttl face in envlp', len(all_merged_faces))
     return all_merged_faces
 
+def mv_extrude_srf(xyzs: np.ndarray, extrusion: float, movement: float) -> dict:
+    '''
+    move the surface (defined by the xyzs) opposite of the surface normal and extrude in normal direction.
+
+    Parameters
+    ----------
+    xyzs: np.ndarray
+        np.ndarray[shape(number of points, 3)] points defining the surface to extrude.
+
+    extrusion: float
+        the magnitude of extrusion
+    
+    movement: float
+        the magnitude of the move
+
+    Returns
+    -------
+    dict
+        dictionary of the polymesh with two keys: vertices and indices.
+    '''
+    g3d_verts = geomie3d.create.vertex_list(xyzs)
+    face = geomie3d.create.polygon_face_frm_verts(g3d_verts) 
+    nrml = geomie3d.get.face_normal(face)
+    rev_nrml = geomie3d.calculate.reverse_vectorxyz(nrml)
+    midxyz = geomie3d.calculate.face_midxyz(face)
+    mv_xyz = geomie3d.calculate.move_xyzs([midxyz], [rev_nrml], [movement])[0]
+    mv_face = geomie3d.modify.move_topo(face, mv_xyz)
+    ext_face = geomie3d.create.extrude_polygon_face(mv_face, nrml, extrusion)
+    faces = geomie3d.get.faces_frm_solid(ext_face)
+    mesh_dict = geomie3d.modify.faces2polymesh(faces)
+    return mesh_dict
+
 def sepr_holes_faces(merged_faces: list[geomie3d.topobj.Face], orig_faces: list[geomie3d.topobj.Face]) -> dict:
     """
     checked if the merged faces are actually holes. This is done by checking if the original triangulated surface mid points fall within the merge faces. If the midpt is not in the merged faces, it must be a hole.
@@ -1345,3 +1533,4 @@ def validate_ifc(ifc_path: str):
     # else:
     #     print('Error !!')
     #     pprint(logger.statements)
+
